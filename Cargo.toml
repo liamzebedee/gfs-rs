@@ -14,8 +14,18 @@ path = "src/lib.rs"
 byte-unit = "5.1.4"
 crc32fast = "1.4.2"
 lru = "0.12.5"
+protobuf = "3.7.1"
 sha2 = "0.10.8"
 tokio = { version = "1.41.0", features = ["full", "sync"] }
 
 trie-rs = "0.4.2"
 
+# The core APIs, including the Serialize and Deserialize traits. Always
+# required when using Serde. The "derive" feature is only required when
+# using #[derive(Serialize, Deserialize)] to make Serde work with structs
+# and enums defined in your crate.
+serde = { version = "1.0", features = ["derive"] }
+
+# Each data format lives in its own crate; the sample code below uses JSON
+# but you may be using a different one.
+serde_json = "1.0"

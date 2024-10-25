@@ -1,12 +1,12 @@
 use gfs::master::MasterServer;
-use gfs::master::Client;
-use gfs::master::Chunkserver;
-use gfs::master::ChunkserverStorage;
-use gfs::master::NetworkShim;
+use gfs::client::Client;
+use gfs::chunkserver::Chunkserver;
+use gfs::chunkserver::ChunkserverStorage;
+use gfs::common::NetworkShim;
+use gfs::master::MasterServerState;
 use byte_unit::Byte;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
-use tokio::sync::Mutex as TMutex;
 
 
 #[tokio::main]
@@ -15,19 +15,30 @@ async fn main() {
 
     // Setup master.
     println!("Creating master.\n");
-    let master = Arc::new(Mutex::new(MasterServer::new(network.clone())));
+    let master_state_path = PathBuf::from("./data/master/state");
+    let master_state: MasterServerState = {
+        if master_state_path.try_exists().unwrap_or(false) {
+            MasterServerState::from_file(master_state_path)
+        } else {
+            std::fs::create_dir_all(master_state_path.parent().unwrap()).unwrap();
+            let master_state = MasterServerState::new();
+            master_state.to_file(master_state_path);
+            master_state
+        }
+    };
+    let master = Arc::new(Mutex::new(MasterServer::new(network.clone(), master_state)));
 
     // Setup client.
     println!("Creating client.\n");
     let client: Client = Client::new(master.clone());
     
     // Get a directory listing.
-    println!("ls /"); client.ls("/").iter().for_each(|x| println!("{}", x));
-    println!("ls /files/"); client.ls("/files/").iter().for_each(|x| println!("{}", x));
+    println!("> ls /"); client.ls("/").iter().for_each(|x| println!("{}", x));
+    println!("> ls /files/"); client.ls("/files/").iter().for_each(|x| println!("{}", x));
 
     // Get disk usage.
-    println!("df"); println!("disk free: {:#}", Byte::from_u64(client.df()));
-    println!("du"); println!("disk used: {:#}", Byte::from_u64(client.du()));
+    println!("> df"); println!("disk free: {:#}", Byte::from_u64(client.df()));
+    println!("> du"); println!("disk used: {:#}", Byte::from_u64(client.du()));
 
     // Setup chunkserver 1-N.
     let n_chunkservers = 3;
@@ -84,10 +95,9 @@ async fn main() {
     //     master.lock().unwrap().run().await;
     // });
 
-
     // Get disk usage.
-    println!("df"); println!("disk free: {:#}", Byte::from_u64(client.df()));
-    println!("du"); println!("disk used: {:#}", Byte::from_u64(client.du()));
+    println!("> df"); println!("disk free: {:#}", Byte::from_u64(client.df()));
+    println!("> du"); println!("disk used: {:#}", Byte::from_u64(client.du()));
 
     // Poll until master has 3 chunkservers free.
     while master.lock().unwrap().get_free_chunkservers(1).len() < 3 {
@@ -95,8 +105,16 @@ async fn main() {
     }
 
     // Convert string to bytes.
-    let data = "hello world".as_bytes();
-    client.append("/test", data, network);
+    client.append("/test", "hello world\n".as_bytes(), network.clone());
+    client.append("/test", "hello again".as_bytes(), network.clone());
+
+    println!("> ls /"); client.ls_tree("/").iter().for_each(|x| println!("{}", x));
+    println!("> df"); println!("disk free: {:#}", Byte::from_u64(client.df()));
+    println!("> du"); println!("disk used: {:#}", Byte::from_u64(client.du()));
+
+    // master_state.to_file(master_state_path);
+
+    // client.read("/test", 0, 100, network.clone());
 
     // Now issue some appends from the client.
     // First client calls master for set of chunkservers to store data.
