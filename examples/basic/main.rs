@@ -27,6 +27,12 @@ async fn main() {
         }
     };
     let master = Arc::new(Mutex::new(MasterServer::new(network.clone(), master_state)));
+    let master_thread = master.clone();
+
+    // Start master.
+    std::thread::spawn(move || {
+        master_thread.lock().unwrap().run();
+    });
 
     // Setup client.
     println!("Creating client.\n");
@@ -77,9 +83,6 @@ async fn main() {
         let cs2 = chunkserver.clone();
 
         // Start the chunkserver.
-        // tokio::spawn(async move {
-        //     chunkserver.lock().await.run();            
-        // });
         std::thread::spawn(move || {
             chunkserver.lock().unwrap().run();
         });
@@ -100,19 +103,21 @@ async fn main() {
     println!("> du"); println!("disk used: {:#}", Byte::from_u64(client.du()));
 
     // Poll until master has 3 chunkservers free.
-    while master.lock().unwrap().get_free_chunkservers(1).len() < 3 {
+    while master.lock().unwrap().get_free_chunkservers(1, 3).len() < 3 {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
     // Convert string to bytes.
     client.append("/test", "hello world\n".as_bytes(), network.clone());
     client.append("/test", "hello again".as_bytes(), network.clone());
+    client.append("/test", "dog".as_bytes(), network.clone());
 
     println!("> ls /"); client.ls_tree("/").iter().for_each(|x| println!("{}", x));
     println!("> df"); println!("disk free: {:#}", Byte::from_u64(client.df()));
     println!("> du"); println!("disk used: {:#}", Byte::from_u64(client.du()));
 
     // master_state.to_file(master_state_path);
+    println!("> cat /test"); println!("{:?}", client.read_full("/test", network));
 
     // client.read("/test", 0, 100, network.clone());
 

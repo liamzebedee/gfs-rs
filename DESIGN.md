@@ -57,3 +57,42 @@ so long as you can upload as many chunks as possible??
 
 or we're just makign something
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+write:
+
+ask master for chunkservers
+
+file 
+[] // no chunks
+
+file 
+[1] // 1 chunk, partial
+
+file 
+[1] // 1 chunk, full
+
+
+
+an append should do the following:
+
+if the file has no chunks, simply append
+if the file has 1 chunk, not full (empty space), 
+  if the append overlaps chunk boundary, we want the append to be atomic in the face of concurrent writers
+  
+  so simply ping master, sequence the new chunks as pending

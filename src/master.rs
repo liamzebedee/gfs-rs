@@ -4,27 +4,31 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::vec;
+use crate::chunk::ChunkHash;
 use crate::chunkserver::{*};
 use crate::common::{*};
+use crate::chunk::{*};
 
-
-pub trait MasterProcess {
-    /// List the files in a directory.
-    fn ls(&self, path: &str) -> Vec<String>;
-    /// List the file tree for a path prefix (akin to `tree`).
-    fn ls_tree(&self, path: &str) -> Vec<String>;
-    /// Get the total number of bytes free in the filesystem (disk free).
-    fn df(&self) -> u64;
-    /// Get the total number of bytes used in the filesystem (disk used).
-    fn du(&self) -> u64;
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MasterError {
+    FileNotFound,
+    EndOfFile,
+    ChunkNotFound,
+    ChunkserverNotFound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct File {
     /// The length of the file in bytes.
     pub length: u64,
     /// The chunks that make up the file.
     pub chunks: Vec<u64>,
+}
+
+pub struct StatInfo {
+    /// The length of the file in bytes.
+    pub length: u64,
 }
 
 #[allow(dead_code)]
@@ -73,10 +77,7 @@ pub struct MasterServer {
 
     // Ephermal state.
     chunkservers: HashMap<String, ChunkserverInfo>,
-
-    /// Chunkserver locations.
-    chunk_locations: Vec<ChunkLocation>,
-    // chunk_locations: HashMap<u64, Vec<String>>,
+    chunk_locations: HashMap<u64, Vec<String>>,
 
     network: Arc<Mutex<NetworkShim>>,
 }
@@ -86,14 +87,36 @@ struct DiskStats {
     disk_free: u64,
 }
 
-pub struct DatumLocation {
-    pub datum_id: [u8; 32],
-    pub chunkserver_id: String,
-}
 
 struct ChunkLocation {
     chunk_id: u64,
     chunkserver: String,
+}
+
+pub struct AppendOperation {
+    /// The file path to append to.
+    pub file_path: String,
+
+    /// The sequence of chunk hashes.
+    pub chunk_sequence: Vec<ChunkHash>,
+
+    /// The locations of the chunks.
+    pub chunk_locations: HashMap<ChunkHash, Vec<String>>,
+    
+    /// The length of the data to append in bytes.
+    pub length: u64,
+}
+
+pub struct ChunkRead {
+    pub chunk_id: u64,
+    pub locations: Vec<String>,
+}
+
+pub struct ReadOperationInfo {
+    pub path: String,
+    pub offset: u64,
+    pub length: u64,
+    pub chunk_reads: Vec<ChunkRead>,
 }
 
 impl MasterServer {
@@ -102,11 +125,11 @@ impl MasterServer {
             state,
             chunkservers: HashMap::new(),
             network,
-            chunk_locations: Vec::new(),
+            chunk_locations: HashMap::new(),
         }
     }
 
-    pub async fn run(&self) {
+    pub fn run(&self) {
         // Run the master server.
     }
 
@@ -122,8 +145,8 @@ impl MasterServer {
         DiskStats { disk_used, disk_free }
     }
 
-    pub fn get_free_chunkservers(&self, _num_chunks: u64) -> Vec<String> {
-        // Get a list of chunkservers that have enough space to store the chunks.
+    /// Get a list of chunkservers that have enough free storage space to store the chunks.
+    pub fn get_free_chunkservers(&self, _num_chunks: u64, replication_factor: u8) -> Vec<String> {
         let mut chunkservers = self.chunkservers.values().collect::<Vec<&ChunkserverInfo>>();
         // Sort by disk free space and then map onto id
         chunkservers.sort_by(|a, b| a.disk_free.cmp(&b.disk_free));
@@ -136,65 +159,66 @@ impl MasterServer {
         chunk_id
     }
 
+
+    ///
+    /// Chunkserver file API's.
+    /// 
+
     /// Appends to a file path, creating the file if it does not exist.
-    pub fn append_file(&mut self, path: &str, datums: Vec<[u8; 32]>, datum_locations: Vec<DatumLocation>, append_length: u64) {
-        let mut chunks = vec![];
-        let mut chunk_locations = vec![];
-
-        // Get the file entry (or default).
-        let mut file = self.state.file_table.get(path).cloned().unwrap_or(File {
-            length: 0,
-            chunks: vec![],
-        });
-
-        for datum in datums {
-            // Allocate chunk ID.
+    pub fn append_file(&mut self, op: AppendOperation) -> Result<(), String> {
+        // 1. Allocate chunk ID for each chunk.
+        let hash_to_chunk_id: HashMap<ChunkHash, u64> = op.chunk_sequence.iter().map(|hash| {
             let chunk_id = self.allocate_chunk();
+            (hash.clone(), chunk_id)
+        }).collect();
 
-            // Commit the datums at all replicas.
-            for loc in &datum_locations {
-                if loc.datum_id != datum { continue; }
+        // 2. Commit each chunk.
+        let mut committed_chunk_locations: HashMap<u64, Vec<String>> = HashMap::new();
+
+        // For each chunk and its locations:
+        for (chunk_hash, chunk_locations) in op.chunk_locations.iter() {
+            // Get the chunk ID.
+            let chunk_id = hash_to_chunk_id[chunk_hash];
+
+            // For each location.
+            for (i, chunk_location) in chunk_locations.iter().enumerate() {
+                // 1. Get the chunkserver.
+                let chunkserver = self.network.lock().unwrap().get_node(chunk_location).unwrap();
+                // TODO handle chunkserver not found in real implementation.
                 
-                // Get the chunkserver from the networkshim.
-                let chunkserver = self.network
-                    .lock().unwrap()
-                    .get_node(&loc.chunkserver_id)
-                    .unwrap();
-                let mut chunkserver = chunkserver.lock().unwrap();
+                // 2. Commit the chunk.
+                let res = chunkserver.lock().unwrap().commit_chunk(*chunk_hash, chunk_id);
+                
+                // If failed, just ignore.
+                if res.is_err() {
+                    println!("[master] failed to commit chunk {} to {}; skipping", chunk_id, chunk_location);
+                    continue;
+                }
 
-                // Commit the chunk to the chunkserver.
-                // TODO err.
-                chunkserver.commit_chunk(datum, chunk_id).unwrap();
-
-                // Store the chunk location.
-                chunk_locations.push(ChunkLocation {
-                    chunk_id,
-                    chunkserver: loc.chunkserver_id.clone(),
-                });
+                // 3. Store the chunk location.
+                committed_chunk_locations
+                    .entry(chunk_id)
+                    .or_default()
+                    .push(chunk_location.clone());
             }
-
-            // Create the chunk.
-            let chunk = Chunk {
-                id: chunk_id,
-                checksum: 0,
-            };
-            chunks.push(chunk);
         }
 
-        // Append chunks to file.
-        file.chunks.extend(chunks.iter().map(|c| c.id));
-        file.length += append_length;
+        // 3. Update the file entry.
+        let file = self.state.file_table.entry(op.file_path.clone()).or_default();
+        file.chunks.extend(committed_chunk_locations.keys());
+        file.length += op.length;
+        println!("[master] append {} bytes={} chunks={}", op.file_path, op.length, committed_chunk_locations.keys().len());
 
-        // Update the file entry.
-        self.state.file_table.insert(path.to_string(), file);
+        // 4. Update the chunk locations.
+        // TODO check what Rust does with the iterator here.
+        self.chunk_locations.extend(committed_chunk_locations);
 
-        // Update the chunk locations.
-        self.chunk_locations.extend(chunk_locations);
+        Ok(())
     }
 
-    // 
-    // Chunkserver API's.
-    // 
+    /// 
+    /// Chunkserver control API's.
+    /// 
     
     /// Receive a heartbeat from a chunkserver.
     pub fn receive_heartbeat(&mut self, chunkserver_id: String, disk_used: u64, disk_free: u64) {
@@ -218,10 +242,12 @@ impl MasterServer {
     }
 
 
-}
+    ///
+    /// Client API's.
+    /// 
 
-impl MasterProcess for MasterServer {
-    fn ls(&self, path: &str) -> Vec<String> {
+    /// List the files in a directory.
+    pub fn ls(&self, path: &str) -> Vec<String> {
         let mut result = Vec::new();
         let base_path = Path::new(path);
         
@@ -241,7 +267,8 @@ impl MasterProcess for MasterServer {
         result
     }
 
-    fn ls_tree(&self, path: &str) -> Vec<String> {
+    /// List the file tree for a path prefix (akin to `tree`).
+    pub fn ls_tree(&self, path: &str) -> Vec<String> {
         let mut result = Vec::new();
         for (file_path, _) in self.state.file_table.iter() {
             if file_path.starts_with(path) {
@@ -251,17 +278,49 @@ impl MasterProcess for MasterServer {
         result
     }
 
-    fn df(&self) -> u64 {
+    /// Get the total number of bytes free in the filesystem (disk free).
+    pub fn df(&self) -> u64 {
         self.compute_stats().disk_free
     }
 
-    fn du(&self) -> u64 {
+    /// Get the total number of bytes used in the filesystem (disk used).
+    pub fn du(&self) -> u64 {
         self.compute_stats().disk_used
     }
 
+    /// Get the metadata for a file.
+    pub fn stat(&self, path: &str) -> StatInfo {
+        let file = self.state.file_table.get(path).unwrap();
+        StatInfo { length: file.length }
+    }
+
+    /// Get chunks and their locations for a read operation.
+    pub fn get_read_infos(&self, path: &str, offset: u64, length: u64) -> Result<ReadOperationInfo, MasterError> {
+        println!("[master] get_read_infos path={} offset={} length={}", path, offset, length);
+
+        let Some(file) = self.state.file_table.get(path) else { return Err(MasterError::FileNotFound) };
+        let offset_chunk = offset / CHUNK_SIZE_BYTES as u64;
+        let end_chunk = (offset + length) / CHUNK_SIZE_BYTES as u64;
+
+        // The offset chunk is the first chunk we need to read.
+        // If the offset exceeds the file length, return an EOF error.
+        if file.length < offset {
+            return Err(MasterError::EndOfFile);
+        }
+
+        // The end chunk is the last chunk we need to read.
+        // If the end chunk exceeds the file length, truncate it.
+        let end_chunk = std::cmp::min(end_chunk, (file.length as f64 / CHUNK_SIZE_BYTES as f64).ceil() as u64);
+
+        let mut chunk_reads = vec![];
+        // For each chunk, get the chunk ID and locations.
+        for i in offset_chunk..=end_chunk {
+            let chunk_id = file.chunks[i as usize];
+            let locations = self.chunk_locations.get(&chunk_id).unwrap();
+            chunk_reads.push(ChunkRead { chunk_id, locations: locations.clone() });
+        }
+
+        Ok(ReadOperationInfo { path: path.to_string(), offset, length, chunk_reads })
+    }
 
 }
-
-
-
-
